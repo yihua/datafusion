@@ -274,6 +274,29 @@ impl<'a> StreamingMergeBuilder<'a> {
     }
 }
 
+/// Returns whether [`StreamingMergeBuilder::build`] merges on `expressions` in
+/// the row format rather than with a cursor for a single column.
+pub(crate) fn merges_in_row_format(
+    expressions: &LexOrdering,
+    schema: &arrow::datatypes::Schema,
+) -> bool {
+    if expressions.len() > 1 {
+        return true;
+    }
+    let Ok(data_type) = expressions[0].expr.data_type(schema) else {
+        return true;
+    };
+    !(data_type.is_primitive()
+        || matches!(
+            data_type,
+            DataType::Utf8
+                | DataType::Utf8View
+                | DataType::LargeUtf8
+                | DataType::Binary
+                | DataType::LargeBinary
+        ))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{common::collect, stream::RecordBatchStreamAdapter};

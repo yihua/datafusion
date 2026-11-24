@@ -42,7 +42,9 @@ use crate::metrics::{
 };
 use crate::projection::{ProjectionExec, make_with_child, update_ordering};
 use crate::sorts::IncrementalSortIterator;
-use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
+use crate::sorts::streaming_merge::{
+    SortedSpillFile, StreamingMergeBuilder, merges_in_row_format,
+};
 use crate::spill::get_record_batch_memory_size;
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::{GetSlicedSize, SpillManager};
@@ -59,7 +61,7 @@ use crate::{
 
 use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow::compute::{concat_batches, lexsort_to_indices, take_arrays};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_common::config::SpillCompression;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
@@ -67,11 +69,11 @@ use datafusion_common::{
     unwrap_or_internal_err,
 };
 use datafusion_execution::TaskContext;
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryLimit, MemoryReservation};
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_expr::PhysicalExpr;
-use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, lit};
+use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, lit};
 
 use futures::{StreamExt, TryStreamExt};
 use log::{debug, trace};
@@ -614,7 +616,8 @@ impl ExternalSorter {
         if self.in_mem_batches.len() == 1 {
             let batch = self.in_mem_batches.swap_remove(0);
             let reservation = self.reservation.take();
-            let sorted_stream = self.sort_batch_stream(batch, reservation)?;
+            let sorted_stream =
+                self.sort_batch_stream(batch, reservation, self.batch_size)?;
             return Ok(self.observe_if_output(sorted_stream, is_output_stream));
         }
 
@@ -627,7 +630,8 @@ impl ExternalSorter {
                 .try_resize(get_reserved_bytes_for_record_batch(&batch)?)
                 .map_err(Self::err_with_oom_context)?;
             let reservation = self.reservation.take();
-            let sorted_stream = self.sort_batch_stream(batch, reservation)?;
+            let sorted_stream =
+                self.sort_batch_stream(batch, reservation, self.batch_size)?;
             return Ok(self.observe_if_output(sorted_stream, is_output_stream));
         }
 
@@ -649,7 +653,8 @@ impl ExternalSorter {
                 let reservation = self
                     .reservation
                     .split(get_reserved_bytes_for_record_batch(&batch)?);
-                let input = self.sort_batch_stream(batch, reservation)?;
+                let batch_size = self.merge_run_batch_size(&batch)?;
+                let input = self.sort_batch_stream(batch, reservation, batch_size)?;
                 Ok(spawn_buffered(input, 1))
             })
             .collect::<Result<_>>()?;
@@ -734,6 +739,7 @@ impl ExternalSorter {
         &self,
         batch: RecordBatch,
         reservation: MemoryReservation,
+        batch_size: usize,
     ) -> Result<SendableRecordBatchStream> {
         assert_eq!(
             get_reserved_bytes_for_record_batch(&batch)?,
@@ -742,7 +748,6 @@ impl ExternalSorter {
 
         let schema = batch.schema();
         let expressions = self.expr.clone();
-        let batch_size = self.batch_size;
 
         let stream = futures::stream::once(async move {
             let schema = batch.schema();
@@ -775,6 +780,75 @@ impl ExternalSorter {
         .try_flatten();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+
+    /// Batch size for the sorted run `run` when it feeds a merge. A merge in the
+    /// row format holds the encoded keys of every run's current batch at once,
+    /// and each run is one buffered batch, so with narrow rows and several keys
+    /// the keys of all runs can outgrow the buffered data. The sort reserves
+    /// about twice each run, so keys that are no larger than the run fit next
+    /// to the sorted copy. Otherwise, under a memory limit, the run is sorted
+    /// into batches of an eighth of `batch_size`, but at least 1024 rows, so the
+    /// merge holds the keys of one small batch per run. Backport of the core of
+    /// apache/datafusion#26953; runs with view or dictionary columns keep
+    /// `batch_size`, since `take` would charge every chunk for shared buffers.
+    fn merge_run_batch_size(&self, run: &RecordBatch) -> Result<usize> {
+        let limited = !matches!(
+            self.runtime.memory_pool.memory_limit(),
+            MemoryLimit::Infinite
+        );
+        let copies_buffers = self.schema.fields().iter().all(|field| {
+            let data_type = field.data_type();
+            data_type.is_primitive()
+                || matches!(
+                    data_type,
+                    DataType::Null
+                        | DataType::Boolean
+                        | DataType::Utf8
+                        | DataType::LargeUtf8
+                        | DataType::Binary
+                        | DataType::LargeBinary
+                        | DataType::FixedSizeBinary(_)
+                )
+        });
+        if limited
+            && copies_buffers
+            && merges_in_row_format(&self.expr, &self.schema)
+            && self.encoded_keys_may_exceed(run)?
+        {
+            Ok((self.batch_size / 8).max(1024).min(self.batch_size))
+        } else {
+            Ok(self.batch_size)
+        }
+    }
+
+    /// Returns whether the row-format keys of `run` may be larger than `run`. A
+    /// computed key is sized from its type if that has a fixed width, and
+    /// otherwise counts as larger.
+    fn encoded_keys_may_exceed(&self, run: &RecordBatch) -> Result<bool> {
+        // An 8-byte offset per row, then a null byte and the bytes of each key
+        let mut encoded = run.num_rows() * size_of::<usize>();
+        for sort_expr in self.expr.iter() {
+            let key_bytes = match sort_expr.expr.downcast_ref::<Column>() {
+                Some(column) => run
+                    .column(column.index())
+                    .to_data()
+                    .get_slice_memory_size()?,
+                None => {
+                    let width = sort_expr
+                        .expr
+                        .data_type(self.schema.as_ref())
+                        .ok()
+                        .and_then(|data_type| data_type.primitive_width());
+                    let Some(width) = width else {
+                        return Ok(true);
+                    };
+                    run.num_rows() * width
+                }
+            };
+            encoded += run.num_rows() + key_bytes;
+        }
+        Ok(encoded > run.get_sliced_size()?)
     }
 
     /// If this sort may spill, pre-allocates
@@ -2075,6 +2149,61 @@ mod tests {
             "The sort should have returned all memory used back to the memory manager"
         );
 
+        Ok(())
+    }
+
+    /// Narrow rows sorted on several keys: the row-format keys of every buffered
+    /// run are larger than the runs, as in the `coalesce(k)`/`isnull(k)` keys a
+    /// Spark null-safe join sorts on. Without splitting the runs, the merge that
+    /// precedes a spill fails in `ExternalSorterMerge` instead of spilling.
+    #[tokio::test]
+    async fn test_multi_key_narrow_rows_spill() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+            Field::new("c", DataType::Int32, true),
+        ]));
+        let rows_per_batch = 8192;
+        let batches = (0..300)
+            .map(|b| {
+                let col = |m: i32| {
+                    Arc::new(Int32Array::from_iter((0..rows_per_batch).map(|r| {
+                        let v = (b * rows_per_batch + r) as i32;
+                        (v % 97 != 0).then_some(v.wrapping_mul(m) % 1009)
+                    }))) as ArrayRef
+                };
+                RecordBatch::try_new(Arc::clone(&schema), vec![col(7), col(13), col(31)])
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let session_config = SessionConfig::new()
+            .with_batch_size(rows_per_batch as usize)
+            .with_sort_spill_reservation_bytes(1024 * 1024);
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(24 * 1024 * 1024, 1.0)
+            .build_arc()?;
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(session_config)
+                .with_runtime(runtime),
+        );
+        let input = TestMemoryExec::try_new_exec(&[batches], Arc::clone(&schema), None)?;
+        let sort_exec = Arc::new(SortExec::new(
+            LexOrdering::new(["a", "b", "c"].iter().map(|c| PhysicalSortExpr {
+                expr: col(c, &schema).unwrap(),
+                options: SortOptions::default(),
+            }))
+            .unwrap(),
+            input,
+        ));
+        let result = collect(
+            Arc::clone(&sort_exec) as Arc<dyn ExecutionPlan>,
+            Arc::clone(&task_ctx),
+        )
+        .await?;
+        let rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 300 * rows_per_batch as usize);
+        assert!(sort_exec.metrics().unwrap().spill_count().unwrap() > 0);
         Ok(())
     }
 
